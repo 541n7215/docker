@@ -1,44 +1,20 @@
-#!/bin/bash
-set -eu
-
-declare -A aliases=(
-	#[18.06]='edge'
-)
-
-# used for auto-detecting the "latest" of each channel (for tagging it appropriately)
-# https://blog.docker.com/2017/03/docker-enterprise-edition/
-declare -A latestChannelRelease=()
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
 self="$(basename "$BASH_SOURCE")"
 cd "$(dirname "$(readlink -f "$BASH_SOURCE")")"
 
-source '.architectures-lib'
-
-parentArches() {
-	local version="$1"; shift # "17.06", etc
-
-	local parent="$(awk 'toupper($1) == "FROM" { print $2 }' "$version/Dockerfile")"
-	echo "${parentRepoToArches[$parent]:-}"
-}
-versionArches() {
-	local version="$1"; shift
-
-	local parentArches="$(parentArches "$version")"
-
-	local versionArches=()
-	for arch in $parentArches; do
-		if hasBashbrewArch "$arch" && grep -qE "^# $arch\$" "$version/Dockerfile"; then
-			versionArches+=( "$arch" )
-		fi
-	done
-	echo "${versionArches[*]}"
-}
-
-versions=( */ )
-versions=( "${versions[@]%/}" )
-
-# sort version numbers with highest first
-IFS=$'\n'; versions=( $(echo "${versions[*]}" | sort -rV) ); unset IFS
+if [ "$#" -eq 0 ]; then
+	versions="$(jq -r '
+		to_entries
+		# sort version numbers with highest first
+		| sort_by(.key | split("[.-]"; "") | map(try tonumber // .))
+		| reverse
+		| map(if .value then .key | @sh else empty end)
+		| join(" ")
+	' versions.json)"
+	eval "set -- $versions"
+fi
 
 # get the most recent commit which modified any of "$@"
 fileCommit() {
@@ -62,12 +38,63 @@ dirCommit() {
 	)
 }
 
+getArches() {
+	local repo="$1"; shift
+	local officialImagesBase="${BASHBREW_LIBRARY:-https://github.com/docker-library/official-images/raw/HEAD/library}/"
+
+	local parentRepoToArchesStr
+	parentRepoToArchesStr="$(
+		find -name 'Dockerfile' -exec awk -v officialImagesBase="$officialImagesBase" '
+				toupper($1) == "FROM" && $2 !~ /^('"$repo"'|scratch|.*\/.*)(:|$)/ {
+					printf "%s%s\n", officialImagesBase, $2
+				}
+			' '{}' + \
+			| sort -u \
+			| xargs -r bashbrew cat --format '["{{ .RepoName }}:{{ .TagName }}"]="{{ join " " .TagEntry.Architectures }}"'
+	)"
+	eval "declare -g -A parentRepoToArches=( $parentRepoToArchesStr )"
+}
+getArches 'docker'
+
+versionArches() {
+	local version="$1"; shift
+	local variant="${1:-}"
+	local selector='dockerUrl'
+	if [[ "$variant" = *rootless ]]; then
+		selector='rootlessExtrasUrl'
+	fi
+
+	if [[ "$variant" = windows/* ]]; then
+		version="$version" jq -r '
+			.[env.version].arches
+			| keys[]
+			| select(startswith("windows-"))
+		' versions.json | sort
+		return
+	fi
+
+	local parent parentArches
+	parent="$(awk 'toupper($1) == "FROM" { print $2 }' "$version/cli/Dockerfile")"
+	parentArches="${parentRepoToArches[$parent]:-}"
+
+	comm -12 \
+		<(
+			version="$version" jq -r --arg selector "$selector" '
+				.[env.version].arches | to_entries[]
+				| select(.value[$selector])
+				| .key
+			' versions.json | sort
+		) \
+		<(xargs -n1 <<<"$parentArches" | sort)
+}
+
 cat <<-EOH
 # this file is generated via https://github.com/docker-library/docker/blob/$(fileCommit "$self")/$self
 
 Maintainers: Tianon Gravi <tianon@dockerproject.org> (@tianon),
              Joseph Ferguson <yosifkit@gmail.com> (@yosifkit)
 GitRepo: https://github.com/docker-library/docker.git
+Builder: buildkit
 EOH
 
 # prints "$2$1$3$1...$N"
@@ -77,21 +104,17 @@ join() {
 	echo "${out#$sep}"
 }
 
-for version in "${versions[@]}"; do
+# used for auto-detecting the "latest" of each channel (for tagging it appropriately)
+# https://blog.docker.com/2017/03/docker-enterprise-edition/
+declare -A latestChannelRelease=()
+
+for version; do
+	export version
 	rcVersion="${version%-rc}"
 
-	commit="$(dirCommit "$version")"
-
-	fullVersion="$(git show "$commit":"$version/Dockerfile" | awk '$1 == "ENV" && $2 == "DOCKER_VERSION" { print $3; exit }')"
-
-	if [ "$rcVersion" != "$version" ] && [ -e "$rcVersion/Dockerfile" ]; then
-		# if this is a "-rc" release, let's make sure the release it contains isn't already GA (and thus something we should not publish anymore)
-		rcFullVersion="$(git show HEAD:"$rcVersion/Dockerfile" | awk '$1 == "ENV" && $2 == "DOCKER_VERSION" { print $3; exit }')"
-		latestVersion="$({ echo "$fullVersion"; echo "$rcFullVersion"; } | sort -V | tail -1)"
-		if [[ "$fullVersion" == "$rcFullVersion"* ]] || [ "$latestVersion" = "$rcFullVersion" ]; then
-			# "x.y.z-rc1" == x.y.z*
-			continue
-		fi
+	if ! fullVersion="$(jq -er '.[env.version] | if . then .version else empty end' versions.json)"; then
+		# support running "generate-stackbrew-library.sh" on a singular "null" version ("20.10-rc" when the RC is older than the GA release, for example)
+		continue
 	fi
 
 	versionAliases=()
@@ -103,12 +126,13 @@ for version in "${versions[@]}"; do
 	else
 		versionAliases+=( $fullVersion )
 	fi
-	versionAliases+=(
-		$version
-	)
+	if [ "$fullVersion" != "$version" ]; then
+		versionAliases+=(
+			$version
+		)
+	fi
 
 	# add a few channel/version-related aliases
-	channel="$(versionChannel "$version")"
 	majorVersion="${version%%.*}"
 	if [ "$version" != "$rcVersion" ] && [ -z "${latestChannelRelease['rc']:-}" ]; then
 		versionAliases+=( 'rc' )
@@ -118,16 +142,13 @@ for version in "${versions[@]}"; do
 		versionAliases+=( "$majorVersion" )
 		latestChannelRelease["$majorVersion"]="$version"
 	fi
-	versionAliases+=(
-		${aliases[$version]:-}
-	)
-	if [ -z "${latestChannelRelease[$channel]:-}" ]; then
-		versionAliases+=( "$channel" )
-		latestChannelRelease[$channel]="$version"
+
+	channel='stable'
+	if [ "$rcVersion" != "$version" ]; then
+		channel='test'
 	fi
 	# every release goes into the "test" channel, so the biggest numbered release wins (RC or not)
 	if [ -z "${latestChannelRelease['test']:-}" ]; then
-		versionAliases+=( 'test' )
 		latestChannelRelease['test']="$version"
 	fi
 	if [ "$version" = "$rcVersion" ] && [ -z "${latestChannelRelease['latest']:-}" ]; then
@@ -135,40 +156,37 @@ for version in "${versions[@]}"; do
 		latestChannelRelease['latest']="$version"
 	fi
 
-	versionArches="$(versionArches "$version")"
+	variants="$(jq -r '.[env.version].variants | map(@sh) | join(" ")' versions.json)"
+	eval "variants=( $variants )"
 
-	echo
-	cat <<-EOE
-		Tags: $(join ', ' "${versionAliases[@]}")
-		Architectures: $(join ', ' $versionArches)
-		GitCommit: $commit
-		Directory: $version
-	EOE
-
-	for v in \
-		dind dind-rootless git \
-		windows/windowsservercore-{ltsc2016,1709} \
-	; do
+	for v in "${variants[@]}"; do
 		dir="$version/$v"
 		[ -f "$dir/Dockerfile" ] || continue
-		variant="$(basename "$v")"
 
 		commit="$(dirCommit "$dir")"
 
+		variant="$(basename "$v")"
 		variantAliases=( "${versionAliases[@]/%/-$variant}" )
 		variantAliases=( "${variantAliases[@]//latest-/}" )
 
-		case "$v" in
-			# https://github.com/docker/docker-ce/blob/8fb3bb7b2210789a4471c017561c1b0de0b4f145/components/engine/hack/make/binary-daemon#L24
-			# "vpnkit is amd64-only" ... for now??
-			dind-rootless) variantArches='amd64' ;;
-
-			windows/*) variantArches='windows-amd64' ;;
-			*)         variantArches="$versionArches" ;;
-		esac
+		if [ "$variant" = 'cli' ] || [ "$variant" = 'dind' ]; then
+			parent="$(awk 'toupper($1) == "FROM" { print $2 }' "$version/cli/Dockerfile")"
+			alpine="${parent#*:}" # "3.14"
+			suiteAliases=( "${variantAliases[0]}" ) # only "X.Y.Z-foo"
+			suiteAliases=( "${suiteAliases[@]/%/-alpine$alpine}" )
+			suiteAliases=( "${suiteAliases[@]//latest-/}" )
+			variantAliases+=( "${suiteAliases[@]}" )
+			if [ "$variant" = 'dind' ]; then
+				# add "latest" aliases
+				suiteAliases=( "${versionAliases[0]}" ) # only "X.Y.Z-foo"
+				suiteAliases=( "${suiteAliases[@]/%/-alpine$alpine}" )
+				suiteAliases=( "${suiteAliases[@]//latest-/}" )
+				variantAliases+=( "${versionAliases[@]}" "${suiteAliases[@]}" )
+			fi
+		fi
 
 		sharedTags=()
-		if [[ "$variant" == 'windowsservercore'* ]]; then
+		if [[ "$variant" == windowsservercore* ]]; then
 			sharedTags=( "${versionAliases[@]/%/-windowsservercore}" )
 			sharedTags=( "${sharedTags[@]//latest-/}" )
 		fi
@@ -179,10 +197,13 @@ for version in "${versions[@]}"; do
 			echo "SharedTags: $(join ', ' "${sharedTags[@]}")"
 		fi
 		cat <<-EOE
-			Architectures: $(join ', ' $variantArches)
+			Architectures: $(join ', ' $(versionArches "$version" "$v"))
 			GitCommit: $commit
 			Directory: $dir
 		EOE
-		[ "$variant" = "$v" ] || echo "Constraints: $variant"
+		if [ "$variant" != "$v" ]; then
+			echo "Constraints: $variant"
+			echo 'Builder: classic' # no Windows support in BuildKit (yet)
+		fi
 	done
 done
